@@ -388,3 +388,143 @@
     )
 )
 
+
+
+(define-map maintenance-funds
+    { property-id: uint }
+    {
+        balance: uint,
+        monthly-contribution: uint,
+        last-collection: uint
+    }
+)
+
+(define-public (setup-maintenance-fund (property-id uint) (monthly-amount uint))
+    (let (
+        (property (unwrap! (map-get? properties { id: property-id }) ERR-PROPERTY-NOT-FOUND))
+    )
+        (begin
+            (asserts! (is-eq tx-sender (get owner property)) ERR-NOT-AUTHORIZED)
+            (map-set maintenance-funds
+                { property-id: property-id }
+                {
+                    balance: u0,
+                    monthly-contribution: monthly-amount,
+                    last-collection: stacks-block-height
+                }
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (contribute-maintenance-fund (property-id uint))
+    (let (
+        (fund (unwrap! (map-get? maintenance-funds { property-id: property-id }) ERR-PROPERTY-NOT-FOUND))
+        (shares (unwrap! (map-get? share-ownership { property-id: property-id, owner: tx-sender }) ERR-NOT-AUTHORIZED))
+        (property (unwrap! (map-get? properties { id: property-id }) ERR-PROPERTY-NOT-FOUND))
+        (share-contribution (/ (* (get monthly-contribution fund) (get shares shares)) (get total-shares property)))
+    )
+        (begin
+            (try! (stx-transfer? share-contribution tx-sender (as-contract tx-sender)))
+            (map-set maintenance-funds
+                { property-id: property-id }
+                (merge fund { balance: (+ (get balance fund) share-contribution) })
+            )
+            (ok true)
+        )
+    )
+)
+
+
+
+(define-public (withdraw-maintenance-fund (property-id uint))
+    (let (
+        (fund (unwrap! (map-get? maintenance-funds { property-id: property-id }) ERR-PROPERTY-NOT-FOUND))
+        (property (unwrap! (map-get? properties { id: property-id }) ERR-PROPERTY-NOT-FOUND))
+    )
+        (begin
+            (asserts! (is-eq tx-sender (get owner property)) ERR-NOT-AUTHORIZED)
+            (try! (stx-transfer? (get balance fund) tx-sender tx-sender))
+            (map-set maintenance-funds
+                { property-id: property-id }
+                { balance: u0, monthly-contribution: u0, last-collection: stacks-block-height }
+            )
+            (ok true)
+        )
+    )
+)
+
+
+(define-map share-listings
+    { listing-id: uint }
+    {
+        property-id: uint,
+        seller: principal,
+        share-count: uint,
+        price-per-share: uint,
+        active: bool
+    }
+)
+
+(define-data-var next-listing-id uint u1)
+
+(define-public (create-share-listing (property-id uint) (share-count uint) (price-per-share uint))
+    (let (
+        (listing-id (var-get next-listing-id))
+        (seller-shares (unwrap! (map-get? share-ownership { property-id: property-id, owner: tx-sender }) ERR-INSUFFICIENT-SHARES))
+    )
+        (begin
+            (asserts! (>= (get shares seller-shares) share-count) ERR-INSUFFICIENT-SHARES)
+            (map-set share-listings
+                { listing-id: listing-id }
+                {
+                    property-id: property-id,
+                    seller: tx-sender,
+                    share-count: share-count,
+                    price-per-share: price-per-share,
+                    active: true
+                }
+            )
+            (var-set next-listing-id (+ listing-id u1))
+            (ok listing-id)
+        )
+    )
+)
+
+(define-public (transfer-shares (property-id uint) (from principal) (to principal) (amount uint))
+    (let (
+        (from-shares (unwrap! (map-get? share-ownership { property-id: property-id, owner: from }) ERR-INSUFFICIENT-SHARES))
+        (to-shares (default-to { shares: u0 } (map-get? share-ownership { property-id: property-id, owner: to })))
+    )
+        (begin
+            (asserts! (>= (get shares from-shares) amount) ERR-INSUFFICIENT-SHARES)
+            (map-set share-ownership
+                { property-id: property-id, owner: from }
+                { shares: (- (get shares from-shares) amount) }
+            )
+            (map-set share-ownership
+                { property-id: property-id, owner: to }
+                { shares: (+ (get shares to-shares) amount) }
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (purchase-listed-shares (listing-id uint))
+    (let (
+        (listing (unwrap! (map-get? share-listings { listing-id: listing-id }) (err u200)))
+        (total-cost (* (get share-count listing) (get price-per-share listing)))
+    )
+        (begin
+            (asserts! (get active listing) (err u200)))
+            (try! (stx-transfer? total-cost tx-sender (get seller listing)))
+            (try! (transfer-shares (get property-id listing) (get seller listing) tx-sender (get share-count listing)))
+            (map-set share-listings
+                { listing-id: listing-id }
+                (merge listing { active: false })
+            )
+            (ok true)
+        )
+    )
