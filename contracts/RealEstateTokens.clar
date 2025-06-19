@@ -29,6 +29,28 @@
   }
 )
 
+(define-map property-analytics
+  { property-id: uint }
+  {
+    total-rental-collected: uint,
+    total-maintenance-spent: uint,
+    total-investment: uint,
+    occupancy-days: uint,
+    vacancy-days: uint,
+    last-updated: uint
+  }
+)
+
+(define-map monthly-performance
+  { property-id: uint, month: uint }
+  {
+    rental-income: uint,
+    maintenance-costs: uint,
+    occupancy-rate: uint,
+    net-income: uint
+  }
+)
+
 ;; Track ownership of shares
 (define-map share-ownership
   { property-id: uint, owner: principal }
@@ -528,3 +550,139 @@
             (ok true)
         )
     )
+
+
+
+
+(define-public (initialize-analytics (property-id uint))
+  (let (
+    (property (unwrap! (map-get? properties { id: property-id }) ERR-PROPERTY-NOT-FOUND))
+  )
+    (begin
+      (asserts! (is-eq tx-sender (get owner property)) ERR-NOT-AUTHORIZED)
+      (map-set property-analytics
+        { property-id: property-id }
+        {
+          total-rental-collected: u0,
+          total-maintenance-spent: u0,
+          total-investment: (* (get total-shares property) (get price-per-share property)),
+          occupancy-days: u0,
+          vacancy-days: u0,
+          last-updated: stacks-block-height
+        }
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (update-monthly-performance (property-id uint) (month uint) (rental uint) (maintenance uint) (occupancy-rate uint))
+  (let (
+    (property (unwrap! (map-get? properties { id: property-id }) ERR-PROPERTY-NOT-FOUND))
+    (net-income (- rental maintenance))
+  )
+    (begin
+      (asserts! (is-eq tx-sender (get owner property)) ERR-NOT-AUTHORIZED)
+      (asserts! (<= occupancy-rate u100) (err u301))
+      (map-set monthly-performance
+        { property-id: property-id, month: month }
+        {
+          rental-income: rental,
+          maintenance-costs: maintenance,
+          occupancy-rate: occupancy-rate,
+          net-income: net-income
+        }
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (record-occupancy-change (property-id uint) (is-occupied bool))
+  (let (
+    (property (unwrap! (map-get? properties { id: property-id }) ERR-PROPERTY-NOT-FOUND))
+    (analytics (unwrap! (map-get? property-analytics { property-id: property-id }) ERR-PROPERTY-NOT-FOUND))
+    (days-since-update (- stacks-block-height (get last-updated analytics)))
+  )
+    (begin
+      (asserts! (is-eq tx-sender (get owner property)) ERR-NOT-AUTHORIZED)
+      (if is-occupied
+        (map-set property-analytics
+          { property-id: property-id }
+          (merge analytics {
+            occupancy-days: (+ (get occupancy-days analytics) days-since-update),
+            last-updated: stacks-block-height
+          })
+        )
+        (map-set property-analytics
+          { property-id: property-id }
+          (merge analytics {
+            vacancy-days: (+ (get vacancy-days analytics) days-since-update),
+            last-updated: stacks-block-height
+          })
+        )
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-read-only (get-property-analytics (property-id uint))
+  (map-get? property-analytics { property-id: property-id })
+)
+
+(define-read-only (get-monthly-performance (property-id uint) (month uint))
+  (map-get? monthly-performance { property-id: property-id, month: month })
+)
+
+(define-read-only (calculate-roi (property-id uint))
+  (let (
+    (analytics (unwrap-panic (map-get? property-analytics { property-id: property-id })))
+    (total-investment (get total-investment analytics))
+    (net-profit (- (get total-rental-collected analytics) (get total-maintenance-spent analytics)))
+  )
+    (if (> total-investment u0)
+      (/ (* net-profit u10000) total-investment)
+      u0
+    )
+  )
+)
+
+(define-read-only (calculate-occupancy-rate (property-id uint))
+  (let (
+    (analytics (unwrap-panic (map-get? property-analytics { property-id: property-id })))
+    (total-days (+ (get occupancy-days analytics) (get vacancy-days analytics)))
+  )
+    (if (> total-days u0)
+      (/ (* (get occupancy-days analytics) u100) total-days)
+      u0
+    )
+  )
+)
+
+(define-read-only (calculate-rental-yield (property-id uint))
+  (let (
+    (analytics (unwrap-panic (map-get? property-analytics { property-id: property-id })))
+    (annual-rental (get total-rental-collected analytics))
+    (property-value (get total-investment analytics))
+  )
+    (if (> property-value u0)
+      (/ (* annual-rental u10000) property-value)
+      u0
+    )
+  )
+)
+
+(define-read-only (get-performance-summary (property-id uint))
+  (let (
+    (analytics (unwrap-panic (map-get? property-analytics { property-id: property-id })))
+  )
+    {
+      roi: (calculate-roi property-id),
+      occupancy-rate: (calculate-occupancy-rate property-id),
+      rental-yield: (calculate-rental-yield property-id),
+      net-income: (- (get total-rental-collected analytics) (get total-maintenance-spent analytics)),
+      total-investment: (get total-investment analytics)
+    }
+  )
+)
