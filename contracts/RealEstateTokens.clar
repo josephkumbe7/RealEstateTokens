@@ -12,6 +12,33 @@
 (define-constant ERR-INSUFFICIENT-SHARES (err u103))
 (define-constant ERR-ALREADY-EXISTS (err u104))
 
+
+(define-constant ERR-PAYMENT-FAILED (err u105))
+(define-constant ERR-PAYMENT-ALREADY-MADE (err u106))
+(define-constant ERR-INVALID-PAYMENT-AMOUNT (err u107))
+
+(define-map rental-payment-schedule
+  { property-id: uint }
+  {
+    tenant: principal,
+    monthly-rent: uint,
+    due-day: uint,
+    next-payment-due: uint,
+    auto-pay-enabled: bool
+  }
+)
+
+(define-map payment-history
+  { property-id: uint, payment-month: uint }
+  {
+    amount-paid: uint,
+    payment-date: uint,
+    late-fee: uint,
+    paid-by: principal
+  }
+)
+
+
 ;; Data structures
 
 ;; Property details
@@ -683,6 +710,123 @@
       rental-yield: (calculate-rental-yield property-id),
       net-income: (- (get total-rental-collected analytics) (get total-maintenance-spent analytics)),
       total-investment: (get total-investment analytics)
+    }
+  )
+)
+
+(define-public (setup-rental-payments (property-id uint) (tenant principal) (monthly-rent uint) (due-day uint))
+  (let (
+    (property (unwrap! (map-get? properties { id: property-id }) ERR-PROPERTY-NOT-FOUND))
+    (current-month (/ stacks-block-height u144))
+    (next-due-block (+ (* current-month u144) (* due-day u6)))
+  )
+    (begin
+      (asserts! (is-eq tx-sender (get owner property)) ERR-NOT-AUTHORIZED)
+      (asserts! (<= due-day u30) (err u400))
+      (map-set rental-payment-schedule
+        { property-id: property-id }
+        {
+          tenant: tenant,
+          monthly-rent: monthly-rent,
+          due-day: due-day,
+          next-payment-due: next-due-block,
+          auto-pay-enabled: false
+        }
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (enable-auto-pay (property-id uint))
+  (let (
+    (schedule (unwrap! (map-get? rental-payment-schedule { property-id: property-id }) ERR-PROPERTY-NOT-FOUND))
+  )
+    (begin
+      (asserts! (is-eq tx-sender (get tenant schedule)) ERR-NOT-AUTHORIZED)
+      (map-set rental-payment-schedule
+        { property-id: property-id }
+        (merge schedule { auto-pay-enabled: true })
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (pay-rent (property-id uint))
+  (let (
+    (schedule (unwrap! (map-get? rental-payment-schedule { property-id: property-id }) ERR-PROPERTY-NOT-FOUND))
+    (property (unwrap! (map-get? properties { id: property-id }) ERR-PROPERTY-NOT-FOUND))
+    (current-month (/ stacks-block-height u144))
+    (existing-payment (map-get? payment-history { property-id: property-id, payment-month: current-month }))
+    (is-late (> stacks-block-height (get next-payment-due schedule)))
+    (late-fee (if is-late (/ (get monthly-rent schedule) u20) u0))
+    (total-amount (+ (get monthly-rent schedule) late-fee))
+  )
+    (begin
+      (asserts! (is-eq tx-sender (get tenant schedule)) ERR-NOT-AUTHORIZED)
+      (asserts! (is-none existing-payment) ERR-PAYMENT-ALREADY-MADE)
+      
+      (try! (stx-transfer? total-amount tx-sender (get owner property)))
+      
+      (map-set payment-history
+        { property-id: property-id, payment-month: current-month }
+        {
+          amount-paid: total-amount,
+          payment-date: stacks-block-height,
+          late-fee: late-fee,
+          paid-by: tx-sender
+        }
+      )
+      
+      (map-set rental-payment-schedule
+        { property-id: property-id }
+        (merge schedule { 
+          next-payment-due: (+ (get next-payment-due schedule) u4320)
+        })
+      )
+      
+      (ok total-amount)
+    )
+  )
+)
+
+(define-public (process-auto-payment (property-id uint))
+  (let (
+    (schedule (unwrap! (map-get? rental-payment-schedule { property-id: property-id }) ERR-PROPERTY-NOT-FOUND))
+    (current-month (/ stacks-block-height u144))
+    (existing-payment (map-get? payment-history { property-id: property-id, payment-month: current-month }))
+  )
+    (begin
+      (asserts! (get auto-pay-enabled schedule) ERR-NOT-AUTHORIZED)
+      (asserts! (>= stacks-block-height (get next-payment-due schedule)) ERR-PAYMENT-FAILED)
+      (asserts! (is-none existing-payment) ERR-PAYMENT-ALREADY-MADE)
+      
+      (as-contract (pay-rent property-id))
+    )
+  )
+)
+
+(define-read-only (get-rental-schedule (property-id uint))
+  (map-get? rental-payment-schedule { property-id: property-id })
+)
+
+(define-read-only (get-payment-history (property-id uint) (month uint))
+  (map-get? payment-history { property-id: property-id, payment-month: month })
+)
+
+(define-read-only (calculate-payment-status (property-id uint))
+  (let (
+    (schedule (unwrap-panic (map-get? rental-payment-schedule { property-id: property-id })))
+    (current-month (/ stacks-block-height u144))
+    (payment-record (map-get? payment-history { property-id: property-id, payment-month: current-month }))
+    (is-overdue (> stacks-block-height (get next-payment-due schedule)))
+  )
+    {
+      payment-made: (is-some payment-record),
+      is-overdue: is-overdue,
+      days-late: (if is-overdue (/ (- stacks-block-height (get next-payment-due schedule)) u144) u0),
+      next-due: (get next-payment-due schedule)
     }
   )
 )
