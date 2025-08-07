@@ -714,6 +714,324 @@
   )
 )
 
+;; Property Damage Claims and Insurance Processing System
+;; Additional error codes for damage claims
+(define-constant ERR-CLAIM-NOT-FOUND (err u200))
+(define-constant ERR-CLAIM-ALREADY-PROCESSED (err u201))
+(define-constant ERR-INVALID-CLAIM-STATUS (err u202))
+(define-constant ERR-INSUFFICIENT-INSURANCE-COVERAGE (err u203))
+(define-constant ERR-CLAIM-EXPIRED (err u204))
+
+;; Damage incident records
+(define-map damage-incidents
+  { incident-id: uint }
+  {
+    property-id: uint,
+    reporter: principal,
+    incident-type: (string-ascii 50),
+    description: (string-ascii 300),
+    estimated-damage: uint,
+    incident-date: uint,
+    status: (string-ascii 20),
+    evidence-hash: (string-ascii 64)
+  }
+)
+
+;; Insurance claims linked to damage incidents
+(define-map insurance-claims
+  { claim-id: uint }
+  {
+    incident-id: uint,
+    property-id: uint,
+    claimant: principal,
+    claimed-amount: uint,
+    approved-amount: uint,
+    claim-date: uint,
+    processing-deadline: uint,
+    status: (string-ascii 20),
+    adjuster-notes: (string-ascii 200)
+  }
+)
+
+;; Damage payouts to shareholders
+(define-map damage-payouts
+  { claim-id: uint, recipient: principal }
+  {
+    amount: uint,
+    payout-date: uint,
+    share-percentage: uint,
+    claim-processed: bool
+  }
+)
+
+;; Track claim appeals
+(define-map claim-appeals
+  { appeal-id: uint }
+  {
+    claim-id: uint,
+    appellant: principal,
+    appeal-reason: (string-ascii 250),
+    appeal-date: uint,
+    appeal-status: (string-ascii 20),
+    resolution: (string-ascii 200)
+  }
+)
+
+;; Data variables for ID tracking
+(define-data-var next-incident-id uint u1)
+(define-data-var next-claim-id uint u1)
+(define-data-var next-appeal-id uint u1)
+
+;; Report a damage incident to the property
+(define-public (report-damage-incident 
+    (property-id uint) 
+    (incident-type (string-ascii 50)) 
+    (description (string-ascii 300)) 
+    (estimated-damage uint)
+    (evidence-hash (string-ascii 64))
+  )
+  (let (
+    (property (unwrap! (map-get? properties { id: property-id }) ERR-PROPERTY-NOT-FOUND))
+    (incident-id (var-get next-incident-id))
+    (shares-owned (get shares (default-to { shares: u0 } (map-get? share-ownership { property-id: property-id, owner: tx-sender }))))
+  )
+    (begin
+      ;; Only property owner or shareholders can report damage
+      (asserts! (or (is-eq tx-sender (get owner property)) (> shares-owned u0)) ERR-NOT-AUTHORIZED)
+      
+      (map-set damage-incidents
+        { incident-id: incident-id }
+        {
+          property-id: property-id,
+          reporter: tx-sender,
+          incident-type: incident-type,
+          description: description,
+          estimated-damage: estimated-damage,
+          incident-date: stacks-block-height,
+          status: "reported",
+          evidence-hash: evidence-hash
+        }
+      )
+      
+      (var-set next-incident-id (+ incident-id u1))
+      (ok incident-id)
+    )
+  )
+)
+
+;; File insurance claim for damage incident
+(define-public (file-insurance-claim (incident-id uint) (claimed-amount uint))
+  (let (
+    (incident (unwrap! (map-get? damage-incidents { incident-id: incident-id }) ERR-CLAIM-NOT-FOUND))
+    (property (unwrap! (map-get? properties { id: (get property-id incident) }) ERR-PROPERTY-NOT-FOUND))
+    (insurance (unwrap! (map-get? property-insurance { property-id: (get property-id incident) }) ERR-PROPERTY-NOT-FOUND))
+    (claim-id (var-get next-claim-id))
+    (processing-deadline (+ stacks-block-height u4320))
+  )
+    (begin
+      ;; Only property owner can file insurance claims
+      (asserts! (is-eq tx-sender (get owner property)) ERR-NOT-AUTHORIZED)
+      
+      ;; Check insurance hasn't expired
+      (asserts! (< stacks-block-height (get expiry insurance)) ERR-CLAIM-EXPIRED)
+      
+      ;; Check claimed amount doesn't exceed coverage
+      (asserts! (<= claimed-amount (get coverage-amount insurance)) ERR-INSUFFICIENT-INSURANCE-COVERAGE)
+      
+      ;; Incident must be in reported status
+      (asserts! (is-eq (get status incident) "reported") ERR-INVALID-CLAIM-STATUS)
+      
+      (map-set insurance-claims
+        { claim-id: claim-id }
+        {
+          incident-id: incident-id,
+          property-id: (get property-id incident),
+          claimant: tx-sender,
+          claimed-amount: claimed-amount,
+          approved-amount: u0,
+          claim-date: stacks-block-height,
+          processing-deadline: processing-deadline,
+          status: "filed",
+          adjuster-notes: ""
+        }
+      )
+      
+      ;; Update incident status
+      (map-set damage-incidents
+        { incident-id: incident-id }
+        (merge incident { status: "claim-filed" })
+      )
+      
+      (var-set next-claim-id (+ claim-id u1))
+      (ok claim-id)
+    )
+  )
+)
+
+;; Process insurance claim approval (simulates insurance company response)
+(define-public (process-claim-approval (claim-id uint) (approved-amount uint) (adjuster-notes (string-ascii 200)))
+  (let (
+    (claim (unwrap! (map-get? insurance-claims { claim-id: claim-id }) ERR-CLAIM-NOT-FOUND))
+    (property (unwrap! (map-get? properties { id: (get property-id claim) }) ERR-PROPERTY-NOT-FOUND))
+  )
+    (begin
+      ;; Only property owner can process approvals (simulating insurance adjuster)
+      (asserts! (is-eq tx-sender (get owner property)) ERR-NOT-AUTHORIZED)
+      
+      ;; Claim must be in filed status
+      (asserts! (is-eq (get status claim) "filed") ERR-INVALID-CLAIM-STATUS)
+      
+      ;; Approved amount cannot exceed claimed amount
+      (asserts! (<= approved-amount (get claimed-amount claim)) ERR-INSUFFICIENT-INSURANCE-COVERAGE)
+      
+      (map-set insurance-claims
+        { claim-id: claim-id }
+        (merge claim { 
+          approved-amount: approved-amount,
+          status: (if (> approved-amount u0) "approved" "denied"),
+          adjuster-notes: adjuster-notes
+        })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Distribute approved insurance payout to shareholders
+(define-public (distribute-insurance-payout (claim-id uint))
+  (let (
+    (claim (unwrap! (map-get? insurance-claims { claim-id: claim-id }) ERR-CLAIM-NOT-FOUND))
+    (property (unwrap! (map-get? properties { id: (get property-id claim) }) ERR-PROPERTY-NOT-FOUND))
+    (approved-amount (get approved-amount claim))
+  )
+    (begin
+      ;; Only property owner can initiate distribution
+      (asserts! (is-eq tx-sender (get owner property)) ERR-NOT-AUTHORIZED)
+      
+      ;; Claim must be approved
+      (asserts! (is-eq (get status claim) "approved") ERR-INVALID-CLAIM-STATUS)
+      
+      ;; Must have approved amount greater than zero
+      (asserts! (> approved-amount u0) ERR-INSUFFICIENT-INSURANCE-COVERAGE)
+      
+      ;; Update claim status to distributed
+      (map-set insurance-claims
+        { claim-id: claim-id }
+        (merge claim { status: "distributed" })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Claim individual shareholder payout from insurance settlement
+(define-public (claim-damage-payout (claim-id uint))
+  (let (
+    (claim (unwrap! (map-get? insurance-claims { claim-id: claim-id }) ERR-CLAIM-NOT-FOUND))
+    (property (unwrap! (map-get? properties { id: (get property-id claim) }) ERR-PROPERTY-NOT-FOUND))
+    (shares-owned (unwrap! (map-get? share-ownership { property-id: (get property-id claim), owner: tx-sender }) ERR-NOT-AUTHORIZED))
+    (total-shares (get total-shares property))
+    (approved-amount (get approved-amount claim))
+    (share-percentage (/ (* (get shares shares-owned) u10000) total-shares))
+    (payout-amount (/ (* approved-amount share-percentage) u10000))
+    (existing-payout (map-get? damage-payouts { claim-id: claim-id, recipient: tx-sender }))
+  )
+    (begin
+      ;; Claim must be in distributed status
+      (asserts! (is-eq (get status claim) "distributed") ERR-INVALID-CLAIM-STATUS)
+      
+      ;; Must own shares to claim payout
+      (asserts! (> (get shares shares-owned) u0) ERR-NOT-AUTHORIZED)
+      
+      ;; Cannot claim payout twice
+      (asserts! (is-none existing-payout) ERR-CLAIM-ALREADY-PROCESSED)
+      
+      ;; Transfer payout to shareholder
+      (try! (as-contract (stx-transfer? payout-amount contract-caller tx-sender)))
+      
+      ;; Record payout
+      (map-set damage-payouts
+        { claim-id: claim-id, recipient: tx-sender }
+        {
+          amount: payout-amount,
+          payout-date: stacks-block-height,
+          share-percentage: share-percentage,
+          claim-processed: true
+        }
+      )
+      
+      (ok payout-amount)
+    )
+  )
+)
+
+;; File appeal for denied or insufficient claim
+(define-public (file-claim-appeal (claim-id uint) (appeal-reason (string-ascii 250)))
+  (let (
+    (claim (unwrap! (map-get? insurance-claims { claim-id: claim-id }) ERR-CLAIM-NOT-FOUND))
+    (property (unwrap! (map-get? properties { id: (get property-id claim) }) ERR-PROPERTY-NOT-FOUND))
+    (appeal-id (var-get next-appeal-id))
+  )
+    (begin
+      ;; Only claimant can file appeal
+      (asserts! (is-eq tx-sender (get claimant claim)) ERR-NOT-AUTHORIZED)
+      
+      ;; Can only appeal denied or distributed claims
+      (asserts! (or (is-eq (get status claim) "denied") (is-eq (get status claim) "distributed")) ERR-INVALID-CLAIM-STATUS)
+      
+      (map-set claim-appeals
+        { appeal-id: appeal-id }
+        {
+          claim-id: claim-id,
+          appellant: tx-sender,
+          appeal-reason: appeal-reason,
+          appeal-date: stacks-block-height,
+          appeal-status: "pending",
+          resolution: ""
+        }
+      )
+      
+      (var-set next-appeal-id (+ appeal-id u1))
+      (ok appeal-id)
+    )
+  )
+)
+
+;; Read-only functions for damage claims system
+
+(define-read-only (get-damage-incident (incident-id uint))
+  (map-get? damage-incidents { incident-id: incident-id })
+)
+
+(define-read-only (get-insurance-claim (claim-id uint))
+  (map-get? insurance-claims { claim-id: claim-id })
+)
+
+(define-read-only (get-damage-payout (claim-id uint) (recipient principal))
+  (map-get? damage-payouts { claim-id: claim-id, recipient: recipient })
+)
+
+(define-read-only (get-claim-appeal (appeal-id uint))
+  (map-get? claim-appeals { appeal-id: appeal-id })
+)
+
+(define-read-only (calculate-shareholder-payout (claim-id uint) (shareholder principal))
+  (let (
+    (claim (unwrap-panic (map-get? insurance-claims { claim-id: claim-id })))
+    (property (unwrap-panic (map-get? properties { id: (get property-id claim) })))
+    (shares-owned (get shares (default-to { shares: u0 } (map-get? share-ownership { property-id: (get property-id claim), owner: shareholder }))))
+    (total-shares (get total-shares property))
+    (approved-amount (get approved-amount claim))
+  )
+    (if (> total-shares u0)
+      (/ (* approved-amount shares-owned) total-shares)
+      u0
+    )
+  )
+)
+
 (define-public (setup-rental-payments (property-id uint) (tenant principal) (monthly-rent uint) (due-day uint))
   (let (
     (property (unwrap! (map-get? properties { id: property-id }) ERR-PROPERTY-NOT-FOUND))
@@ -830,3 +1148,6 @@
     }
   )
 )
+
+
+
